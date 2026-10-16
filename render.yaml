@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: avani-2o-ai-server
+    env: node
+    plan: free
+    buildCommand: cd server && npm install
+    startCommand: cd server && node server.js
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: GEMINI_API_KEY
+        sync: false
