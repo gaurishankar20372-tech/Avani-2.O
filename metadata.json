@@ -1,0 +1,6 @@
+{
+  "name": "Avani 2.O",
+  "description": "Voice-first personal AI assistant with natural voice, phone control, coding & project builder, memory, tasks, and Gemini intelligence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
