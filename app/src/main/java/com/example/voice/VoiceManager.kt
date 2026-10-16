@@ -8,6 +8,7 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.speech.tts.Voice
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -43,6 +44,7 @@ class VoiceManager(private val context: Context) : VoiceEngineProvider {
     private var speechRecognizer: SpeechRecognizer? = null
     private var textToSpeech: TextToSpeech? = null
     private var isTtsInitialized = false
+    private var pendingFinishCallback: (() -> Unit)? = null
 
     var speechRate: Float = 1.0f
     var speechPitch: Float = 1.0f
@@ -56,6 +58,8 @@ class VoiceManager(private val context: Context) : VoiceEngineProvider {
         textToSpeech = TextToSpeech(context) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 isTtsInitialized = true
+                configureHumanVoice(Locale.forLanguageTag("hi-IN"))
+
                 textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {
                         _voiceState.value = VoiceState.SPEAKING
@@ -65,10 +69,14 @@ class VoiceManager(private val context: Context) : VoiceEngineProvider {
                         if (_voiceState.value == VoiceState.SPEAKING) {
                             _voiceState.value = VoiceState.IDLE
                         }
+                        val callback = pendingFinishCallback
+                        pendingFinishCallback = null
+                        callback?.invoke()
                     }
 
                     override fun onError(utteranceId: String?) {
                         _voiceState.value = VoiceState.IDLE
+                        pendingFinishCallback = null
                     }
                 })
             } else {
@@ -77,8 +85,37 @@ class VoiceManager(private val context: Context) : VoiceEngineProvider {
         }
     }
 
+    /**
+     * Select highest-quality human natural voice engine available on Android
+     */
+    private fun configureHumanVoice(locale: Locale) {
+        try {
+            textToSpeech?.language = locale
+            val voices = textToSpeech?.voices ?: return
+            
+            // Prioritize high-quality neural/natural voice models
+            val humanVoice = voices.find { v ->
+                v.locale.language == locale.language &&
+                (v.quality >= Voice.QUALITY_VERY_HIGH ||
+                 v.name.contains("neural", ignoreCase = true) ||
+                 v.name.contains("natural", ignoreCase = true) ||
+                 v.name.contains("wavenet", ignoreCase = true))
+            } ?: voices.find { v ->
+                v.locale.language == locale.language && v.quality >= Voice.QUALITY_HIGH
+            } ?: voices.find { v ->
+                v.locale.language == locale.language
+            }
+
+            if (humanVoice != null) {
+                textToSpeech?.voice = humanVoice
+            }
+        } catch (e: Exception) {
+            Log.e("VoiceManager", "Error configuring human voice", e)
+        }
+    }
+
     override fun startListening(onResult: (String) -> Unit, onError: (String) -> Unit) {
-        stopSpeech() // Stop speaking when user wants to speak
+        stopSpeech() // Stop speaking when listening starts
 
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
             onError("Speech recognition is not available on this device.")
@@ -113,7 +150,7 @@ class VoiceManager(private val context: Context) : VoiceEngineProvider {
                         _voiceState.value = VoiceState.IDLE
                         _audioRms.value = 0f
                         val message = when (error) {
-                            SpeechRecognizer.ERROR_NO_MATCH -> "No speech recognized. Try speaking again."
+                            SpeechRecognizer.ERROR_NO_MATCH -> "No speech recognized. Please speak again."
                             SpeechRecognizer.ERROR_AUDIO -> "Audio recording error."
                             SpeechRecognizer.ERROR_NETWORK -> "Network error during speech recognition."
                             SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission required."
@@ -132,12 +169,7 @@ class VoiceManager(private val context: Context) : VoiceEngineProvider {
                         }
                     }
 
-                    override fun onPartialResults(partialResults: Bundle?) {
-                        val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        matches?.firstOrNull()?.let {
-                            // Can show live partial transcription
-                        }
-                    }
+                    override fun onPartialResults(partialResults: Bundle?) {}
 
                     override fun onEvent(eventType: Int, params: Bundle?) {}
                 })
@@ -178,29 +210,30 @@ class VoiceManager(private val context: Context) : VoiceEngineProvider {
         }
 
         try {
+            pendingFinishCallback = onFinished
             textToSpeech?.setSpeechRate(speechRate)
             textToSpeech?.setPitch(speechPitch)
 
             // Auto-detect Hindi vs English
             val containsDevanagari = text.any { it in '\u0900'..'\u097F' }
             val locale = if (containsDevanagari) Locale.forLanguageTag("hi-IN") else Locale.US
-            textToSpeech?.language = locale
+            configureHumanVoice(locale)
 
-            // Strip code blocks or markdown headers from spoken text for natural voice
-            val spokenText = cleanTextForSpeech(text)
-
-            val utteranceId = "Avani_TTS_${System.currentTimeMillis()}"
+            val spokenText = cleanTextForHumanSpeech(text)
+            val utteranceId = "Avani_HumanTTS_${System.currentTimeMillis()}"
             _voiceState.value = VoiceState.SPEAKING
             textToSpeech?.speak(spokenText, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
         } catch (e: Exception) {
             Log.e("VoiceManager", "TTS speak failed", e)
             _voiceState.value = VoiceState.IDLE
+            pendingFinishCallback = null
             onFinished?.invoke()
         }
     }
 
     override fun stopSpeech() {
         try {
+            pendingFinishCallback = null
             textToSpeech?.stop()
             if (_voiceState.value == VoiceState.SPEAKING) {
                 _voiceState.value = VoiceState.INTERRUPTED
@@ -217,6 +250,7 @@ class VoiceManager(private val context: Context) : VoiceEngineProvider {
 
     override fun shutdown() {
         try {
+            pendingFinishCallback = null
             speechRecognizer?.destroy()
             speechRecognizer = null
             textToSpeech?.stop()
@@ -227,11 +261,13 @@ class VoiceManager(private val context: Context) : VoiceEngineProvider {
         }
     }
 
-    private fun cleanTextForSpeech(input: String): String {
+    private fun cleanTextForHumanSpeech(input: String): String {
         return input
-            .replace(Regex("```[\\s\\S]*?```"), "Code attached.")
-            .replace(Regex("[#*`_\\[\\]]"), "")
+            .replace(Regex("```[\\s\\S]*?```"), "Code generate ho gaya hai, aap screen par dekh sakte hain.")
+            .replace(Regex("[#*`_\\[\\]{}]"), "")
             .replace(Regex("https?://\\S+"), "web link")
-            .take(350) // Keep spoken answer comfortably concise
+            .replace("open_app", "app open")
+            .replace("initiate_call", "call")
+            .take(300) // Optimal length for human conversational cadence
     }
 }

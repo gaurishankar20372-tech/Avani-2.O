@@ -30,7 +30,16 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
+enum class AppMode {
+    VOICE_MODE, // Live Human-Like Voice Conversation (Gemini Live / ChatGPT Voice style)
+    CHAT_MODE   // Pure Text Chat (ChatGPT / Google Gemini text style)
+}
+
 data class AssistantUiState(
+    val appMode: AppMode = AppMode.VOICE_MODE,
+    val isLiveContinuousLoop: Boolean = true,
+    val liveUserSubtitle: String = "",
+    val liveAssistantSubtitle: String = "",
     val isAssistantActive: Boolean = true,
     val isEmergencyStopped: Boolean = false,
     val voiceState: VoiceState = VoiceState.IDLE,
@@ -173,11 +182,25 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         voiceManager.stopListening()
     }
 
+    fun setAppMode(mode: AppMode) {
+        _uiState.value = _uiState.value.copy(appMode = mode)
+        if (mode == AppMode.CHAT_MODE) {
+            voiceManager.stopSpeech()
+            voiceManager.stopListening()
+        }
+    }
+
+    fun toggleLiveContinuousLoop(enabled: Boolean) {
+        _uiState.value = _uiState.value.copy(isLiveContinuousLoop = enabled)
+    }
+
     fun processUserInput(input: String) {
         val trimmed = input.trim()
         if (trimmed.isBlank() || !_uiState.value.isAssistantActive || _uiState.value.isEmergencyStopped) {
             return
         }
+
+        val isVoiceMode = _uiState.value.appMode == AppMode.VOICE_MODE
 
         viewModelScope.launch {
             // Save user message
@@ -189,8 +212,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             )
 
             _uiState.value = _uiState.value.copy(
-                statusText = "Processing request...",
-                voiceState = VoiceState.PROCESSING
+                statusText = if (isVoiceMode) "Avani thinking..." else "Generating response...",
+                voiceState = VoiceState.PROCESSING,
+                liveUserSubtitle = trimmed
             )
 
             // Prepare memory context
@@ -200,12 +224,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             val response = geminiService.processUserTurn(
                 userPrompt = trimmed,
                 recentHistory = recentHistory,
-                systemMemoryContext = recentMemories
+                systemMemoryContext = recentMemories,
+                isVoiceMode = isVoiceMode
             )
 
             when (response) {
                 is GeminiResponse.FunctionCall -> {
-                    handleFunctionCall(response.functionName, response.arguments)
+                    handleFunctionCall(response.functionName, response.arguments, isVoiceMode)
                 }
 
                 is GeminiResponse.Text -> {
@@ -217,9 +242,20 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     )
                     _uiState.value = _uiState.value.copy(
                         statusText = "Ready",
-                        voiceState = VoiceState.IDLE
+                        voiceState = VoiceState.IDLE,
+                        liveAssistantSubtitle = response.reply
                     )
-                    voiceManager.speak(response.reply)
+                    if (isVoiceMode) {
+                        voiceManager.speak(response.reply) {
+                            if (_uiState.value.appMode == AppMode.VOICE_MODE &&
+                                _uiState.value.isLiveContinuousLoop &&
+                                !_uiState.value.isEmergencyStopped &&
+                                _uiState.value.isAssistantActive
+                            ) {
+                                startListening()
+                            }
+                        }
+                    }
                 }
 
                 is GeminiResponse.Error -> {
@@ -232,14 +268,18 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     )
                     _uiState.value = _uiState.value.copy(
                         statusText = errMsg,
-                        voiceState = VoiceState.IDLE
+                        voiceState = VoiceState.IDLE,
+                        liveAssistantSubtitle = errMsg
                     )
+                    if (isVoiceMode) {
+                        voiceManager.speak(errMsg)
+                    }
                 }
             }
         }
     }
 
-    private suspend fun handleFunctionCall(name: String, args: Map<String, Any?>) {
+    private suspend fun handleFunctionCall(name: String, args: Map<String, Any?>, isVoiceMode: Boolean = false) {
         actionRouter.isExplainBeforeActionMode = _uiState.value.isExplainBeforeAction
 
         when (val decision = actionRouter.routeToolCall(name, args)) {
@@ -253,11 +293,22 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                         toolStatus = if (result.success) "success" else "failed"
                     )
                 )
-                voiceManager.speak(result.message)
                 _uiState.value = _uiState.value.copy(
                     statusText = result.message,
-                    voiceState = VoiceState.IDLE
+                    voiceState = VoiceState.IDLE,
+                    liveAssistantSubtitle = result.message
                 )
+                if (isVoiceMode) {
+                    voiceManager.speak(result.message) {
+                        if (_uiState.value.appMode == AppMode.VOICE_MODE &&
+                            _uiState.value.isLiveContinuousLoop &&
+                            !_uiState.value.isEmergencyStopped &&
+                            _uiState.value.isAssistantActive
+                        ) {
+                            startListening()
+                        }
+                    }
+                }
             }
 
             is RoutingDecision.NeedsConfirmation -> {
@@ -265,10 +316,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 _uiState.value = _uiState.value.copy(
                     pendingConfirmation = decision.pendingAction,
                     voiceState = VoiceState.AWAITING_CONFIRMATION,
-                    statusText = "Confirmation needed: ${decision.pendingAction.details}"
+                    statusText = "Confirmation needed: ${decision.pendingAction.details}",
+                    liveAssistantSubtitle = "Confirmation needed: ${decision.pendingAction.details}"
                 )
-                val prompt = "Confirmation required: ${decision.pendingAction.details}. Proceed?"
-                voiceManager.speak(prompt)
+                if (isVoiceMode) {
+                    val prompt = "Aapki permission chahiye: ${decision.pendingAction.details}. Kya aage badhoon?"
+                    voiceManager.speak(prompt)
+                }
             }
 
             is RoutingDecision.Information -> {
@@ -280,11 +334,22 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                         toolStatus = "success"
                     )
                 )
-                voiceManager.speak(decision.message)
                 _uiState.value = _uiState.value.copy(
                     statusText = "Ready",
-                    voiceState = VoiceState.IDLE
+                    voiceState = VoiceState.IDLE,
+                    liveAssistantSubtitle = decision.message
                 )
+                if (isVoiceMode) {
+                    voiceManager.speak(decision.message) {
+                        if (_uiState.value.appMode == AppMode.VOICE_MODE &&
+                            _uiState.value.isLiveContinuousLoop &&
+                            !_uiState.value.isEmergencyStopped &&
+                            _uiState.value.isAssistantActive
+                        ) {
+                            startListening()
+                        }
+                    }
+                }
             }
         }
     }

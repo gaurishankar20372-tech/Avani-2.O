@@ -30,12 +30,13 @@ class GeminiAssistantService {
     suspend fun processUserTurn(
         userPrompt: String,
         recentHistory: List<Pair<String, String>>, // role, content
-        systemMemoryContext: String = ""
+        systemMemoryContext: String = "",
+        isVoiceMode: Boolean = false
     ): GeminiResponse = withContext(Dispatchers.IO) {
         val apiKey = BuildConfig.GEMINI_API_KEY
         if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
             // Local fallback rule execution when API key is not yet configured by user
-            return@withContext executeLocalIntentMatching(userPrompt)
+            return@withContext executeLocalIntentMatching(userPrompt, isVoiceMode)
         }
 
         val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$apiKey"
@@ -43,13 +44,30 @@ class GeminiAssistantService {
         try {
             val root = JSONObject()
 
+            val voiceModePrompt = if (isVoiceMode) {
+                """
+                You are Avani 2.O in LIVE VOICE CONVERSATION mode.
+                Behave EXACTLY like a real, living, warm, intelligent human companion speaking naturally on a phone call.
+                Speak in natural, conversational, fluent Hindi, Hinglish, or English.
+                Use warm human conversational expressions ("Haan bilkul!", "Arey waah!", "Main abhi karti hoon!", "Zaroor!").
+                Keep spoken voice answers punchy, natural, and concise (1-2 friendly sentences), without markdown or bullet lists.
+                You obey ALL phone commands: open apps, initiate calls, send WhatsApp messages, search web, manage project memory.
+                """
+            } else {
+                """
+                You are Avani 2.O in CHAT MODE (just like ChatGPT or Google Gemini).
+                Provide thorough, beautifully formatted text responses with markdown, code snippets, clear explanations, and structure.
+                Do not include conversational voice fillers. Focus on pristine clarity, formatting, and helpfulness.
+                """
+            }
+
             // System instruction
             val systemInstructionObj = JSONObject()
             val sysParts = JSONArray()
             val sysText = JSONObject().apply {
                 put("text", """
-                    You are Avani 2.O, an intelligent, voice-first personal AI assistant for Android.
-                    Personality: Intelligent, warm, confident, supportive, witty when appropriate, professional.
+                    $voiceModePrompt
+                    Personality: Intelligent, empathetic, confident, supportive, witty, professional.
                     Languages: Hindi, English, Hinglish. Auto-detect user's language and respond naturally in the same language.
                     
                     You have real Android tools available. When user intent matches a phone or assistant capability, you MUST call the matching function declaration.
@@ -67,7 +85,6 @@ class GeminiAssistantService {
                     - generate_code(language, requirements)
                     - get_device_capabilities()
                     
-                    When no tool call is needed, provide concise, conversational answers suited for spoken voice.
                     Current User Context & Memory: $systemMemoryContext
                 """.trimIndent())
             }
@@ -284,10 +301,10 @@ class GeminiAssistantService {
                 }
             }
 
-            executeLocalIntentMatching(userPrompt)
+            executeLocalIntentMatching(userPrompt, isVoiceMode)
         } catch (e: Exception) {
             Log.e("GeminiService", "Exception in Gemini call", e)
-            executeLocalIntentMatching(userPrompt)
+            executeLocalIntentMatching(userPrompt, isVoiceMode)
         }
     }
 
@@ -295,7 +312,7 @@ class GeminiAssistantService {
      * Local high-performance intent parser that guarantees full offline and prototype
      * functionality even when network or API key is not yet set!
      */
-    fun executeLocalIntentMatching(prompt: String): GeminiResponse {
+    fun executeLocalIntentMatching(prompt: String, isVoiceMode: Boolean = false): GeminiResponse {
         val lower = prompt.lowercase().trim()
 
         // 1. App opening
